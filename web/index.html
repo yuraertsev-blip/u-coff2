@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base href="$FLUTTER_BASE_HREF">
+  <meta charset="UTF-8">
+  <title>Ю Кофе</title>
+  <meta name="description" content="Управление рабочим графиком кофейни Ю Кофе">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+
+  <!-- PWA Manifest -->
+  <link rel="manifest" href="manifest.json">
+  <meta name="theme-color" content="#4E342E">
+
+  <!-- iOS PWA (Add to Home Screen) -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Ю Кофе">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+
+  <!-- Favicon -->
+  <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+
+  <!-- iOS splash screen background -->
+  <style>
+    body { background-color: #4E342E; margin: 0; }
+  </style>
+</head>
+<body>
+  <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-analytics-compat.js"></script>
+
+  <script>
+    // Твоя конфигурация из консоли Firebase
+    const firebaseConfig = {
+      apiKey: "AIzaSyC0rFOiAx5LEpT-6s9Bc8sxNtc59RfsOcM",
+      authDomain: "u-coffee.firebaseapp.com",
+      databaseURL: "https://u-coffee-default-rtdb.firebaseio.com",
+      projectId: "u-coffee",
+      storageBucket: "u-coffee.firebasestorage.app",
+      messagingSenderId: "971000964907",
+      appId: "1:971000964907:web:b1e9271ca53fbfff6ac76e",
+      measurementId: "G-M5HM5H2D75"
+    };
+
+    // Инициализация Firebase
+    firebase.initializeApp(firebaseConfig);
+    firebase.analytics();
+  </script>
+
+  <script src="flutter_bootstrap.js" async></script>
+
+  <script>
+    // Register Service Worker for PWA
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('sw.js');
+      });
+    }
+  </script>
+</body>
+</html>

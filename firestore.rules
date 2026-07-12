@@ -1,0 +1,41 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Хелпер: админ = авторизованный пользователь с email admin@u-coffee.app
+    function isAdmin() {
+      return request.auth != null
+        && request.auth.token.email == 'admin@u-coffee.app';
+    }
+
+    // График смен: читают все, пишет только админ
+    match /schedule_shifts_v2/{document} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // Пожелания бариста: читают и пишут все (бариста без авторизации)
+    match /schedule_prefs_v2/{document} {
+      allow read, write: if true;
+    }
+
+    // Логи: читают все, создаёт только админ, изменить/удалить нельзя
+    match /logs_v2/{document} {
+      allow read: if true;
+      allow create: if isAdmin();
+      allow update, delete: if false;
+    }
+
+    // Конфигурация (список сотрудников): читают все, пишет только админ
+    match /app_config/{document} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // Всё остальное — полностью закрыто
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
