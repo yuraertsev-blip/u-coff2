@@ -35,14 +35,15 @@ enum ShiftType { none, full, morning, evening }
 enum PrefType { none, ready, readyAfter15, readyBefore15, notReady }
 
 class AppState extends ChangeNotifier {
-  List<String> baristas = [];
+  // Дефолтный список — чтобы UI никогда не видел пустой список
+  static const _defaultBaristas = ['Юрий', 'Валерия', 'Дарьяна', 'Анастасия'];
+  List<String> baristas = List.from(_defaultBaristas);
   Map<String, Map<String, ShiftType>> shifts = {};
   Map<String, Map<String, PrefType>> prefs = {};
   List<String> auditLogs = [];
   String? lastError;
   final FirebaseFirestore _db = FirebaseFirestore.instance;
   final FirebaseAuth _auth = FirebaseAuth.instance;
-  bool _baristasLoaded = false;
 
   // Статус администратора — определяется через Firebase Auth
   bool get isAdmin => _auth.currentUser?.email == 'admin@u-coffee.app';
@@ -75,21 +76,22 @@ class AppState extends ChangeNotifier {
   }
 
   void _initStreams() {
+    // Обработчик ошибок — общий для всех слушателей
+    void handleError(dynamic e) {
+      debugPrint('Firestore error: $e');
+      lastError = 'Ошибка Firestore: проверьте правила доступа';
+      notifyListeners();
+    }
+
     try {
       // Список бариста из Firestore (с fallback на дефолтные)
       _db.collection('app_config').doc('baristas').snapshots().listen((snap) {
         if (snap.exists && snap.data()?['names'] != null) {
-          baristas = List<String>.from(snap.data()!['names']);
-        } else if (!_baristasLoaded) {
-          // Первый запуск — инициализируем дефолтный список
-          baristas = ['Юрий', 'Валерия', 'Дарьяна', 'Анастасия'];
-          _db.collection('app_config').doc('baristas').set({
-            'names': baristas,
-          }).catchError((_) {}); // Может не записаться без прав — ок
+          final names = List<String>.from(snap.data()!['names']);
+          if (names.isNotEmpty) baristas = names;
         }
-        _baristasLoaded = true;
         notifyListeners();
-      });
+      }, onError: handleError);
 
       _db.collection('schedule_shifts_v2').snapshots().listen((snap) {
         shifts.clear();
@@ -103,10 +105,7 @@ class AppState extends ChangeNotifier {
           });
         }
         notifyListeners();
-      }, onError: (e) {
-        lastError = e.toString();
-        notifyListeners();
-      });
+      }, onError: handleError);
 
       _db.collection('schedule_prefs_v2').snapshots().listen((snap) {
         prefs.clear();
@@ -120,7 +119,7 @@ class AppState extends ChangeNotifier {
           });
         }
         notifyListeners();
-      });
+      }, onError: handleError);
 
       _db
           .collection('logs_v2')
@@ -130,7 +129,7 @@ class AppState extends ChangeNotifier {
           .listen((snap) {
         auditLogs = snap.docs.map((doc) => doc.data()['text'] as String).toList();
         notifyListeners();
-      });
+      }, onError: handleError);
     } catch (e) {
       lastError = "Ошибка инициализации потоков: $e";
       notifyListeners();
@@ -986,7 +985,7 @@ class _PreferencesScreenState extends State<PreferencesScreen> {
   @override
   Widget build(BuildContext context) {
     final state = AppStateProvider.of(context);
-    _selectedBarista ??= state.baristas.first;
+    _selectedBarista ??= state.baristas.isNotEmpty ? state.baristas.first : null;
     final daysToRender = CalendarUtils.getDaysInWeek(_selectedMonth, _selectedWeek);
     final monthName = DateFormat('LLLL yyyy', 'ru_RU').format(_selectedMonth);
 
