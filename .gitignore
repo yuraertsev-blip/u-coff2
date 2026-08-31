@@ -37,3 +37,16 @@ jspm_packages/
 *.njsproj
 *.sln
 *.sw?
+
+# Flutter / Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+build/
+# pubspec.lock коммитим намеренно: это приложение, а не библиотека,
+# и сборка в CI должна быть воспроизводимой.
+
+# Firebase service account keys — НИКОГДА не коммитить
+*-adminsdk-*.json
+serviceAccountKey.json

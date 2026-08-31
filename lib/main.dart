@@ -1,33 +1,36 @@
+import 'dart:async';
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:intl/date_symbol_data_local.dart';
-import 'package:firebase_core/firebase_core.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:firebase_auth/firebase_auth.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
-const firebaseOptions = FirebaseOptions(
-  apiKey: "AIzaSyC0rFOiAx5LEpT-6s9Bc8sxNtc59RfsOcM",
-  authDomain: "u-coffee.firebaseapp.com",
-  databaseURL: "https://u-coffee-default-rtdb.firebaseio.com",
-  projectId: "u-coffee",
-  storageBucket: "u-coffee.firebasestorage.app",
-  messagingSenderId: "971000964907",
-  appId: "1:971000964907:web:b1e9271ca53fbfff6ac76e",
-  measurementId: "G-M5HM5H2D75",
-);
+import 'file_download.dart';
+import 'local_cache.dart';
+import 'supabase_config.dart';
 
 late final AppState globalAppState;
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await initializeDateFormatting('ru_RU', null);
-  try {
-    await Firebase.initializeApp(options: firebaseOptions);
-  } catch (e) {
-    debugPrint("Firebase init error: $e");
+  String? initError;
+  if (!SupabaseConfig.isConfigured) {
+    initError = 'Supabase не настроен: заполни lib/supabase_config.dart';
+  } else {
+    try {
+      await Supabase.initialize(
+        url: SupabaseConfig.url,
+        publishableKey: SupabaseConfig.publishableKey,
+      );
+    } catch (e) {
+      debugPrint('Supabase init error: $e');
+      initError = 'Не удалось подключиться к базе. Показан сохранённый график.';
+    }
   }
 
-  globalAppState = AppState();
+  globalAppState = AppState(initError: initError);
   runApp(const MockApp());
 }
 
@@ -37,112 +40,167 @@ enum PrefType { none, ready, readyAfter15, readyBefore15, notReady }
 class AppState extends ChangeNotifier {
   // Дефолтный список — чтобы UI никогда не видел пустой список
   static const _defaultBaristas = ['Юрий', 'Валерия', 'Дарьяна', 'Анастасия'];
+  static const _kBackendDownError =
+      'Нет связи с базой. Показан последний сохранённый график, '
+      'изменения не сохранятся.';
+
   List<String> baristas = List.from(_defaultBaristas);
   Map<String, Map<String, ShiftType>> shifts = {};
   Map<String, Map<String, PrefType>> prefs = {};
   List<String> auditLogs = [];
   String? lastError;
-  final FirebaseFirestore _db = FirebaseFirestore.instance;
-  final FirebaseAuth _auth = FirebaseAuth.instance;
 
-  // Статус администратора — определяется через Firebase Auth
-  bool get isAdmin => _auth.currentUser?.email == 'admin@u-coffee.app';
+  /// false, если Supabase не сконфигурирован или не поднялся: тогда работаем
+  /// только на кэше и ничего не пишем.
+  final bool _backendReady;
+  final List<StreamSubscription<dynamic>> _subs = [];
 
-  AppState() {
-    _initStreams();
-  }
+  SupabaseClient get _sb => Supabase.instance.client;
 
-  /// Вход админа через Firebase Auth — пароль проверяется сервером
-  Future<String?> signInAdmin(String pin) async {
-    try {
-      await _auth.signInWithEmailAndPassword(
-        email: 'admin@u-coffee.app',
-        password: pin,
-      );
-      notifyListeners();
-      return null; // Успех
-    } on FirebaseAuthException catch (e) {
-      if (e.code == 'wrong-password' || e.code == 'invalid-credential') {
-        return 'Неверный PIN-код';
-      }
-      return 'Ошибка авторизации: ${e.message}';
+  bool get isAdmin =>
+      _backendReady && _sb.auth.currentUser?.email == SupabaseConfig.adminEmail;
+
+  bool get isSignedIn => _backendReady && _sb.auth.currentUser != null;
+
+  AppState({String? initError}) : _backendReady = initError == null {
+    lastError = initError;
+    _restoreFromCache();
+    if (_backendReady) {
+      _initStreams();
+      _checkBackendReachable();
     }
   }
 
-  /// Выход из аккаунта
+  @override
+  void dispose() {
+    for (final s in _subs) {
+      s.cancel();
+    }
+    super.dispose();
+  }
+
+  // ------------------------------------------------------------------ вход --
+
+  /// Вход управляющего. PIN — это пароль учётки admin@u-coffee.app,
+  /// проверяет его сервер, в приложении пароля нет.
+  Future<String?> signInAdmin(String pin) =>
+      _signIn(SupabaseConfig.adminEmail, pin);
+
+  /// Вход баристы под общей учёткой — нужен, чтобы писать пожелания.
+  Future<String?> signInBarista(String pin) =>
+      _signIn(SupabaseConfig.baristaEmail, pin);
+
+  Future<String?> _signIn(String email, String pin) async {
+    if (!_backendReady) return 'База не настроена — вход невозможен';
+    try {
+      await _sb.auth.signInWithPassword(email: email, password: pin);
+      lastError = null;
+      notifyListeners();
+      return null;
+    } on AuthException catch (e) {
+      if (e.statusCode == '400' || e.statusCode == '401') {
+        return 'Неверный PIN-код';
+      }
+      return 'Ошибка входа: ${e.message}';
+    } catch (e) {
+      lastError = _kBackendDownError;
+      notifyListeners();
+      return 'Сервер недоступен — вход невозможен';
+    }
+  }
+
   Future<void> signOut() async {
-    await _auth.signOut();
+    if (_backendReady) await _sb.auth.signOut();
+    notifyListeners();
+  }
+
+  // --------------------------------------------------------------- потоки --
+
+  void _handleError(dynamic e) {
+    debugPrint('Supabase stream error: $e');
+    lastError = _kBackendDownError;
     notifyListeners();
   }
 
   void _initStreams() {
-    // Обработчик ошибок — общий для всех слушателей
-    void handleError(dynamic e) {
-      debugPrint('Firestore error: $e');
-      lastError = 'Ошибка Firestore: проверьте правила доступа';
-      notifyListeners();
-    }
-
     try {
-      // Список бариста из Firestore (с fallback на дефолтные)
-      _db.collection('app_config').doc('baristas').snapshots().listen((snap) {
-        if (snap.exists && snap.data()?['names'] != null) {
-          final names = List<String>.from(snap.data()!['names']);
+      _subs.add(
+        _sb.from('baristas').stream(primaryKey: ['id']).order('position',
+            ascending: true).listen((rows) {
+          final names = rows.map((r) => r['name'] as String).toList();
           if (names.isNotEmpty) baristas = names;
-        }
-        notifyListeners();
-      }, onError: handleError);
+          _onDataChanged();
+        }, onError: _handleError),
+      );
 
-      _db.collection('schedule_shifts_v2').snapshots().listen((snap) {
-        shifts.clear();
-        for (var doc in snap.docs) {
-          final dateKey = doc.id;
-          final data = doc.data();
-          data.forEach((barista, typeIndex) {
-            if (!shifts.containsKey(barista)) shifts[barista] = {};
-            shifts[barista]![dateKey] =
-                ShiftType.values[(typeIndex as num).toInt()];
-          });
-        }
-        notifyListeners();
-      }, onError: handleError);
+      _subs.add(
+        _sb.from('shifts').stream(primaryKey: ['date', 'barista']).listen(
+            (rows) {
+          shifts.clear();
+          for (final row in rows) {
+            final barista = row['barista'] as String;
+            final date = row['date'] as String;
+            shifts.putIfAbsent(barista, () => {})[date] =
+                ShiftType.values[(row['type'] as num).toInt()];
+          }
+          _onDataChanged();
+        }, onError: _handleError),
+      );
 
-      _db.collection('schedule_prefs_v2').snapshots().listen((snap) {
-        prefs.clear();
-        for (var doc in snap.docs) {
-          final dateKey = doc.id;
-          final data = doc.data();
-          data.forEach((barista, typeIndex) {
-            if (!prefs.containsKey(barista)) prefs[barista] = {};
-            prefs[barista]![dateKey] =
-                PrefType.values[(typeIndex as num).toInt()];
-          });
-        }
-        notifyListeners();
-      }, onError: handleError);
+      _subs.add(
+        _sb.from('prefs').stream(primaryKey: ['date', 'barista']).listen((rows) {
+          prefs.clear();
+          for (final row in rows) {
+            final barista = row['barista'] as String;
+            final date = row['date'] as String;
+            prefs.putIfAbsent(barista, () => {})[date] =
+                PrefType.values[(row['type'] as num).toInt()];
+          }
+          _onDataChanged();
+        }, onError: _handleError),
+      );
 
-      _db
-          .collection('logs_v2')
-          .orderBy('time', descending: true)
-          .limit(50)
-          .snapshots()
-          .listen((snap) {
-        auditLogs = snap.docs.map((doc) => doc.data()['text'] as String).toList();
-        notifyListeners();
-      }, onError: handleError);
+      _subs.add(
+        _sb
+            .from('logs')
+            .stream(primaryKey: ['id'])
+            .order('created_at')
+            .limit(50)
+            .listen((rows) {
+              auditLogs = rows.map((r) => r['text'] as String).toList();
+              _onDataChanged();
+            }, onError: _handleError),
+      );
     } catch (e) {
-      lastError = "Ошибка инициализации потоков: $e";
+      lastError = 'Ошибка подписки на данные: $e';
       notifyListeners();
     }
   }
 
-  // --- Управление сотрудниками (только админ) ---
-
-  Future<void> _saveBaristas() async {
-    await _db.collection('app_config').doc('baristas').set({
-      'names': baristas,
-    });
+  /// Данные пришли с сервера: снимаем плашку и кладём снимок в локальный кэш.
+  void _onDataChanged() {
+    if (lastError == _kBackendDownError) lastError = null;
+    writeCachedSnapshot(exportJson());
+    notifyListeners();
   }
+
+  /// Явная проверка связи. Подписка при мёртвом сервере может просто молчать,
+  /// а пустой график без объяснения выглядит как «данные пропали».
+  Future<void> _checkBackendReachable() async {
+    try {
+      await _sb
+          .from('baristas')
+          .select('id')
+          .limit(1)
+          .timeout(const Duration(seconds: 15));
+    } catch (e) {
+      debugPrint('Backend unreachable: $e');
+      lastError = _kBackendDownError;
+      notifyListeners();
+    }
+  }
+
+  // ----------------------------------------------------------- сотрудники --
 
   Future<String?> addBarista(String name) async {
     if (!isAdmin) return 'Нет доступа';
@@ -150,10 +208,10 @@ class AppState extends ChangeNotifier {
     if (trimmed.isEmpty) return 'Имя не может быть пустым';
     if (baristas.contains(trimmed)) return 'Сотрудник уже существует';
     try {
-      baristas.add(trimmed);
-      await _saveBaristas();
+      await _sb
+          .from('baristas')
+          .insert({'name': trimmed, 'position': baristas.length});
       await _logAction('Добавлен сотрудник: $trimmed');
-      notifyListeners();
       return null;
     } catch (e) {
       return 'Ошибка: $e';
@@ -166,15 +224,13 @@ class AppState extends ChangeNotifier {
     if (trimmed.isEmpty) return 'Имя не может быть пустым';
     if (trimmed == oldName) return null; // Ничего не менялось
     if (baristas.contains(trimmed)) return 'Сотрудник с таким именем уже есть';
-    final index = baristas.indexOf(oldName);
-    if (index == -1) return 'Сотрудник не найден';
+    if (!baristas.contains(oldName)) return 'Сотрудник не найден';
     try {
-      baristas[index] = trimmed;
-      await _saveBaristas();
-      // Переносим данные смен и пожеланий на новое имя
-      await _migrateEmployeeData(oldName, trimmed);
+      await _sb.from('baristas').update({'name': trimmed}).eq('name', oldName);
+      // Смены и пожелания ссылаются на имя, поэтому переносим их следом.
+      await _sb.from('shifts').update({'barista': trimmed}).eq('barista', oldName);
+      await _sb.from('prefs').update({'barista': trimmed}).eq('barista', oldName);
       await _logAction('Переименован: $oldName → $trimmed');
-      notifyListeners();
       return null;
     } catch (e) {
       return 'Ошибка: $e';
@@ -185,49 +241,89 @@ class AppState extends ChangeNotifier {
     if (!isAdmin) return 'Нет доступа';
     if (!baristas.contains(name)) return 'Сотрудник не найден';
     try {
-      baristas.remove(name);
-      await _saveBaristas();
+      await _sb.from('shifts').delete().eq('barista', name);
+      await _sb.from('prefs').delete().eq('barista', name);
+      await _sb.from('baristas').delete().eq('name', name);
       await _logAction('Удалён сотрудник: $name');
-      notifyListeners();
       return null;
     } catch (e) {
       return 'Ошибка: $e';
     }
   }
 
-  /// Переносит смены и пожелания со старого имени на новое
-  Future<void> _migrateEmployeeData(String oldName, String newName) async {
-    // Смены
-    final shiftsSnap = await _db.collection('schedule_shifts_v2').get();
-    for (var doc in shiftsSnap.docs) {
-      final data = doc.data();
-      if (data.containsKey(oldName)) {
-        await doc.reference.update({
-          newName: data[oldName],
-          oldName: FieldValue.delete(),
-        });
-      }
-    }
-    // Пожелания
-    final prefsSnap = await _db.collection('schedule_prefs_v2').get();
-    for (var doc in prefsSnap.docs) {
-      final data = doc.data();
-      if (data.containsKey(oldName)) {
-        await doc.reference.update({
-          newName: data[oldName],
-          oldName: FieldValue.delete(),
-        });
-      }
+  Future<void> _logAction(String text) async {
+    final timeStr = DateFormat('HH:mm').format(DateTime.now());
+    try {
+      await _sb.from('logs').insert({'text': '$timeStr - $text'});
+    } catch (e) {
+      debugPrint('Log write failed: $e');
     }
   }
 
-  Future<void> _logAction(String text) async {
-    final timeStr = DateFormat('HH:mm').format(DateTime.now());
-    await _db.collection('logs_v2').add({
-      'text': '$timeStr - $text',
-      'time': FieldValue.serverTimestamp(),
-    });
+  // -------------------------------------------------------- экспорт и кэш --
+
+  /// Выгружает всё содержимое приложения в JSON.
+  ///
+  /// Служит двум целям сразу: кнопка «скачать копию» и локальный кэш, который
+  /// показывает график, когда база недоступна.
+  String exportJson() {
+    final data = {
+      'version': 1,
+      'exportedAt': DateTime.now().toIso8601String(),
+      'baristas': baristas,
+      'shifts': shifts.map((barista, byDate) => MapEntry(
+            barista,
+            byDate.map((date, type) => MapEntry(date, type.index)),
+          )),
+      'prefs': prefs.map((barista, byDate) => MapEntry(
+            barista,
+            byDate.map((date, type) => MapEntry(date, type.index)),
+          )),
+      'logs': auditLogs,
+    };
+    return const JsonEncoder.withIndent('  ').convert(data);
   }
+
+  /// Имя файла с датой — чтобы бэкапы не затирали друг друга.
+  String exportFileName() =>
+      'u-coffee-backup-${DateFormat('yyyy-MM-dd').format(DateTime.now())}.json';
+
+  /// Поднимает последний снимок с устройства ещё до ответа сервера, чтобы
+  /// график был виден сразу и не мигал пустым.
+  void _restoreFromCache() {
+    final raw = readCachedSnapshot();
+    if (raw == null) return;
+    try {
+      final data = jsonDecode(raw) as Map<String, dynamic>;
+      final cachedBaristas = (data['baristas'] as List?)?.cast<String>();
+      if (cachedBaristas != null && cachedBaristas.isNotEmpty) {
+        baristas = cachedBaristas;
+      }
+      shifts = _decodeGrid(data['shifts'], ShiftType.values);
+      prefs = _decodeGrid(data['prefs'], PrefType.values);
+      auditLogs = (data['logs'] as List?)?.cast<String>() ?? [];
+    } catch (e) {
+      debugPrint('Cache restore failed: $e');
+    }
+  }
+
+  static Map<String, Map<String, T>> _decodeGrid<T>(
+      dynamic raw, List<T> values) {
+    final result = <String, Map<String, T>>{};
+    if (raw is! Map) return result;
+    raw.forEach((barista, byDate) {
+      if (byDate is! Map) return;
+      final row = <String, T>{};
+      byDate.forEach((date, index) {
+        final i = (index as num).toInt();
+        if (i >= 0 && i < values.length) row['$date'] = values[i];
+      });
+      result['$barista'] = row;
+    });
+    return result;
+  }
+
+  // ----------------------------------------------------- график и желания --
 
   String _dateKey(DateTime d) => DateFormat('yyyy-MM-dd').format(d);
 
@@ -265,23 +361,29 @@ class AppState extends ChangeNotifier {
     notifyListeners();
 
     try {
-      await _db.collection('schedule_shifts_v2').doc(key).set({
-        barista: next.index
-      }, SetOptions(merge: true));
-
-      final timeStr = DateFormat('HH:mm').format(DateTime.now());
+      if (next == ShiftType.none) {
+        await _sb.from('shifts').delete().eq('date', key).eq('barista', barista);
+      } else {
+        await _sb.from('shifts').upsert(
+          {'date': key, 'barista': barista, 'type': next.index},
+          onConflict: 'date,barista',
+        );
+      }
       final dateStr = DateFormat('dd.MM').format(date);
-      await _db.collection('logs_v2').add({
-        'text': '$timeStr - $barista: $actionName на $dateStr',
-        'time': FieldValue.serverTimestamp(),
-      });
+      await _logAction('$barista: $actionName на $dateStr');
     } catch (e) {
-      lastError = "Ошибка доступа Firebase: проверьте правила (Test Mode).";
+      lastError = 'Не удалось сохранить: $e';
       notifyListeners();
     }
   }
 
   Future<void> togglePref(String barista, DateTime date) async {
+    if (!isSignedIn) {
+      lastError = 'Чтобы отмечать пожелания, нужно войти';
+      notifyListeners();
+      return;
+    }
+
     String key = _dateKey(date);
     PrefType current = prefs[barista]?[key] ?? PrefType.none;
     PrefType next = PrefType.none;
@@ -310,11 +412,16 @@ class AppState extends ChangeNotifier {
     notifyListeners();
 
     try {
-      await _db.collection('schedule_prefs_v2').doc(key).set({
-        barista: next.index
-      }, SetOptions(merge: true));
+      if (next == PrefType.none) {
+        await _sb.from('prefs').delete().eq('date', key).eq('barista', barista);
+      } else {
+        await _sb.from('prefs').upsert(
+          {'date': key, 'barista': barista, 'type': next.index},
+          onConflict: 'date,barista',
+        );
+      }
     } catch (e) {
-      lastError = "Ошибка доступа Firebase: проверьте правила (Test Mode).";
+      lastError = 'Не удалось сохранить: $e';
       notifyListeners();
     }
   }
@@ -436,7 +543,8 @@ class LoginScreen extends StatelessWidget {
               const Text('Система управления', style: TextStyle(color: Colors.white70)),
               const SizedBox(height: 60),
               
-              // Бариста — вход без авторизации (только чтение графика + пожелания)
+              // Бариста — общий PIN. Без входа писать пожелания нельзя:
+              // иначе таблица открыта на запись всему интернету.
               SizedBox(
                 width: double.infinity,
                 height: 55,
@@ -444,14 +552,17 @@ class LoginScreen extends StatelessWidget {
                   icon: const Icon(Icons.person),
                   label: const Text('Войти как Бариста', style: TextStyle(fontSize: 16)),
                   style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFFFF8E1), foregroundColor: const Color(0xFF4E342E)),
-                  onPressed: () {
-                    Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const MainScreen()));
-                  },
+                  onPressed: () => _showPinDialog(
+                    context,
+                    state,
+                    title: 'PIN баристы',
+                    signIn: state.signInBarista,
+                  ),
                 ),
               ),
               const SizedBox(height: 16),
-              
-              // Админ — вход через Firebase Auth
+
+              // Управляющий — своя учётка, права шире
               SizedBox(
                 width: double.infinity,
                 height: 55,
@@ -459,8 +570,22 @@ class LoginScreen extends StatelessWidget {
                   icon: const Icon(Icons.admin_panel_settings),
                   label: const Text('Управляющий', style: TextStyle(fontSize: 16)),
                   style: OutlinedButton.styleFrom(foregroundColor: Colors.white, side: const BorderSide(color: Colors.white54)),
-                  onPressed: () => _showPinDialog(context, state),
+                  onPressed: () => _showPinDialog(
+                    context,
+                    state,
+                    title: 'PIN управляющего',
+                    signIn: state.signInAdmin,
+                  ),
                 ),
+              ),
+              const SizedBox(height: 16),
+
+              // Посмотреть график можно и без входа — только чтение.
+              TextButton(
+                onPressed: () => Navigator.pushReplacement(
+                    context, MaterialPageRoute(builder: (_) => const MainScreen())),
+                child: const Text('Просто посмотреть график',
+                    style: TextStyle(color: Colors.white70)),
               ),
             ],
           ),
@@ -469,7 +594,12 @@ class LoginScreen extends StatelessWidget {
     );
   }
 
-  void _showPinDialog(BuildContext context, AppState state) {
+  void _showPinDialog(
+    BuildContext context,
+    AppState state, {
+    required String title,
+    required Future<String?> Function(String pin) signIn,
+  }) {
     final ctrl = TextEditingController();
     bool isLoading = false;
 
@@ -477,13 +607,14 @@ class LoginScreen extends StatelessWidget {
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setDialogState) => AlertDialog(
-          title: const Text('Ввод PIN-кода'),
+          title: Text(title),
           content: TextField(
             controller: ctrl,
             keyboardType: TextInputType.number,
             obscureText: true,
+            maxLength: 6,
             enabled: !isLoading,
-            decoration: const InputDecoration(labelText: 'PIN', hintText: 'Введите пин-код'),
+            decoration: const InputDecoration(labelText: 'PIN', hintText: 'Введите пин-код', counterText: ''),
           ),
           actions: [
             TextButton(
@@ -495,8 +626,8 @@ class LoginScreen extends StatelessWidget {
               onPressed: isLoading ? null : () async {
                 setDialogState(() => isLoading = true);
                 
-                // Пароль проверяется сервером Firebase — не хранится в коде
-                final error = await state.signInAdmin(ctrl.text);
+                // Пароль проверяет сервер Supabase — в коде его нет
+                final error = await signIn(ctrl.text);
                 
                 if (error == null) {
                   Navigator.pop(ctx);
@@ -536,16 +667,37 @@ class _MainScreenState extends State<MainScreen> {
   Widget build(BuildContext context) {
     final state = AppStateProvider.of(context);
     return Scaffold(
-      appBar: state.isAdmin
+      appBar: state.isSignedIn
           ? AppBar(
-              title: const Text('Ю Кофе — Админ'),
-              backgroundColor: Colors.red.shade700,
+              title: Text(state.isAdmin ? 'Ю Кофе — Админ' : 'Ю Кофе'),
+              backgroundColor: state.isAdmin
+                  ? Colors.red.shade700
+                  : const Color(0xFF4E342E),
               actions: [
-                IconButton(
-                  icon: const Icon(Icons.people),
-                  tooltip: 'Сотрудники',
-                  onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const ManageEmployeesScreen())),
-                ),
+                if (state.isAdmin)
+                  IconButton(
+                    icon: const Icon(Icons.people),
+                    tooltip: 'Сотрудники',
+                    onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const ManageEmployeesScreen())),
+                  ),
+                if (state.isAdmin)
+                  IconButton(
+                    icon: const Icon(Icons.download),
+                    tooltip: 'Скачать резервную копию',
+                    onPressed: () {
+                      final messenger = ScaffoldMessenger.of(context);
+                      try {
+                        downloadTextFile(state.exportFileName(), state.exportJson());
+                        messenger.showSnackBar(const SnackBar(
+                          content: Text('Резервная копия скачана'),
+                        ));
+                      } catch (e) {
+                        messenger.showSnackBar(SnackBar(
+                          content: Text('Не удалось скачать копию: $e'),
+                        ));
+                      }
+                    },
+                  ),
                 IconButton(
                   icon: const Icon(Icons.logout),
                   tooltip: 'Выйти',

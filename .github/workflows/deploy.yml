@@ -8,11 +8,14 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       
       - name: Install Flutter
         uses: subosito/flutter-action@v2
         with:
+          # Версия закреплена намеренно: на ней сборка проверена локально.
+          # Обновлять осознанно, а не молча вместе с каналом stable.
+          flutter-version: '3.22.3'
           channel: 'stable'
           
       - name: Build Web

@@ -1,11 +1,13 @@
-const CACHE_NAME = 'u-coffee-v1';
+// Пути относительные: приложение живёт не в корне домена, а в /u-coff2/.
+const CACHE_NAME = 'u-coffee-v2';
 const ASSETS_TO_CACHE = [
-  '/',
-  '/index.html',
-  '/main.dart.js',
-  '/manifest.json',
-  '/icons/icon-192.png',
-  '/icons/icon-512.png',
+  './',
+  './index.html',
+  './flutter_bootstrap.js',
+  './main.dart.js',
+  './manifest.json',
+  './icons/icon-192.png',
+  './icons/icon-512.png',
 ];
 
 // Install — cache core assets
@@ -34,11 +36,15 @@ self.addEventListener('activate', (event) => {
 
 // Fetch — network first, fallback to cache
 self.addEventListener('fetch', (event) => {
+  // Кэшируем только статику самого приложения. Запросы к Supabase и другим
+  // доменам должны идти напрямую, иначе в кэш попадают ответы API.
+  const sameOrigin = new URL(event.request.url).origin === self.location.origin;
+  if (event.request.method !== 'GET' || !sameOrigin) return;
+
   event.respondWith(
     fetch(event.request)
       .then((response) => {
-        // Кэшируем успешные GET-запросы
-        if (event.request.method === 'GET' && response.status === 200) {
+        if (response.status === 200) {
           const clone = response.clone();
           caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
         }
