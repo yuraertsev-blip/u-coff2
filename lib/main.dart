@@ -14,16 +14,23 @@ late final AppState globalAppState;
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await initializeDateFormatting('ru_RU', null);
   String? initError;
+  try {
+    await initializeDateFormatting('ru_RU', null);
+  } catch (e) {
+    debugPrint('Locale init error: $e');
+  }
   if (!SupabaseConfig.isConfigured) {
     initError = 'Supabase не настроен: заполни lib/supabase_config.dart';
   } else {
     try {
+      // Таймаут обязателен: без него зависший запрос к базе не даёт дойти до
+      // runApp, и пользователь видит пустой экран вместо приложения. Лучше
+      // открыться с сохранённым графиком и честной плашкой.
       await Supabase.initialize(
         url: SupabaseConfig.url,
         publishableKey: SupabaseConfig.publishableKey,
-      );
+      ).timeout(const Duration(seconds: 12));
     } catch (e) {
       debugPrint('Supabase init error: $e');
       initError = 'Не удалось подключиться к базе. Показан сохранённый график.';
