@@ -31,11 +31,33 @@
   <script src="flutter_bootstrap.js" async></script>
 
   <script>
-    // Register Service Worker for PWA
+    // Своего service worker здесь больше нет.
+    //
+    // Раньше тут регистрировался sw.js. Он занимал scope, который нужен
+    // штатному flutter_service_worker.js, и кэшировал index.html,
+    // flutter_bootstrap.js и main.dart.js по отдельности. При обрыве связи
+    // файлы оказывались из разных сборок, приложение не запускалось и само не
+    // чинилось — кэш оставался битым. Теперь кэшем PWA занимается Flutter: он
+    // сверяет файлы по манифесту и переключает сборку целиком.
+    //
+    // Снимаем старый sw.js у тех, кому он уже успел установиться, иначе они
+    // останутся на сломанном кэше навсегда.
     if ('serviceWorker' in navigator) {
-      window.addEventListener('load', () => {
-        navigator.serviceWorker.register('sw.js');
-      });
+      navigator.serviceWorker.getRegistrations().then(function (regs) {
+        regs.forEach(function (reg) {
+          // Сверяем по всем трём состояниям: у регистрации Flutter в момент
+          // установки ещё нет active, и по пустой строке мы снесли бы её же.
+          var w = reg.active || reg.waiting || reg.installing;
+          if (w && /\/sw\.js(\?|$)/.test(w.scriptURL)) reg.unregister();
+        });
+      }).catch(function () {});
+    }
+    if (window.caches && caches.keys) {
+      caches.keys().then(function (names) {
+        names.forEach(function (n) {
+          if (n.indexOf('u-coffee-') === 0) caches.delete(n);
+        });
+      }).catch(function () {});
     }
   </script>
 </body>
